@@ -548,4 +548,425 @@ tail -f firewall.log
 This gives a complete Day 3 workflow:
 
 Update Python script → rules.json → set up venv → run GUI → add rules → test → verify logs/iptables.
+Personal Firewall Project — Day 4 Report
+This document describes the Day-4 deliverable: a dynamic, enforcing personal firewall written in Python that:
+
+Sniffs traffic (Scapy)
+
+Applies blocking rules using iptables (IPv4)
+
+Accepts live CLI commands to add/remove/list rules (firewall> prompt)
+
+Persists rules to rules.json and cleans up on exit
+1. Files included / to create
+
+firewall.py4 — Main script (Day 4 dynamic firewall)
+
+rules.json — initial rule set (JSON)
+
+venv/ — Python virtual environment (optional but recommended)
+
+firewall.log — runtime log produced by the program (if enabled later)
+. rules.json (example)
+
+Create rules.json in the same folder as the script (or let the script auto-create defaults)
+{
+  "block_ips": ["192.168.1.7"],
+  "block_ports": [80],
+  "block_protocols": ["ICMP"]
+}
+Full script — firewall.py4
+#!/usr/bin/env python3
+"""
+Personal Firewall - Day 4 Complete Script (ready to paste)
+- Live packet sniffing (IPv4 only)
+- Dynamic CLI to add/remove/list rules
+- Apply rules to iptables immediately
+- Persist rules to rules.json
+- Graceful cleanup on exit / Ctrl+C
+"""
+
+import json
+import subprocess
+import threading
+import sys
+import os
+import time
+import signal
+from scapy.all import sniff, IP, TCP, UDP
+
+# ------------------------------
+# Configuration
+# ------------------------------
+RULES_FILE = "rules.json"
+rules = {"block_ips": [], "block_ports": [], "block_protocols": []}
+
+# ------------------------------
+# Load / Save rules
+# ------------------------------
+def load_rules():
+    global rules
+    if os.path.exists(RULES_FILE):
+        try:
+            with open(RULES_FILE, "r") as f:
+                rules = json.load(f)
+            # Ensure keys exist
+            rules.setdefault("block_ips", [])
+            rules.setdefault("block_ports", [])
+            rules.setdefault("block_protocols", [])
+        except Exception as e:
+            print("Error loading rules.json:", e)
+            rules = {"block_ips": [], "block_ports": [], "block_protocols": []}
+    else:
+        rules = {"block_ips": [], "block_ports": [], "block_protocols": []}
+
+def save_rules():
+    try:
+        with open(RULES_FILE, "w") as f:
+            json.dump(rules, f, indent=2)
+    except Exception as e:
+        print("Error saving rules.json:", e)
+
+# ------------------------------
+# iptables helpers
+# ------------------------------
+def run_cmd(cmd):
+    """Run a shell command list. Return (rc, out, err)."""
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+def flush_iptables():
+    rc, out, err = run_cmd(["sudo", "iptables", "-F"])
+    if rc != 0:
+        print("Warning: failed to flush iptables:", err)
+
+def apply_rules():
+    """
+    Apply rules from `rules` to iptables.
+    This implementation flushes current rules and re-adds configured rules.
+    """
+    # Flush first (be careful in production)
+    flush_iptables()
+
+    # Block IPs (INPUT from src, OUTPUT to dst)
+    for ip in rules.get("block_ips", []):
+        run_cmd(["sudo", "iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"])
+        run_cmd(["sudo", "iptables", "-A", "OUTPUT", "-d", ip, "-j", "DROP"])
+
+    # Block ports (both tcp & udp, INPUT destination port and OUTPUT destination port)
+    for port in rules.get("block_ports", []):
+        try:
+            pstr = str(int(port))
+        except Exception:
+            continue
+        for proto in ("tcp", "udp"):
+            run_cmd(["sudo", "iptables", "-A", "INPUT", "-p", proto, "--dport", pstr, "-j", "DROP"])
+            run_cmd(["sudo", "iptables", "-A", "OUTPUT", "-p", proto, "--dport", pstr, "-j", "DROP"])
+
+    # Block protocols (support ICMP for IPv4)
+    for proto in rules.get("block_protocols", []):
+        if proto.upper() == "ICMP":
+            run_cmd(["sudo", "iptables", "-A", "INPUT", "-p", "icmp", "-j", "DROP"])
+            run_cmd(["sudo", "iptables", "-A", "OUTPUT", "-p", "icmp", "-j", "DROP"])
+        else:
+            # unsupported/unknown protocols can be ignored or extended here
+            pass
+
+    print("✅ Applied iptables rules from configuration.")
+
+# ------------------------------
+# Packet matching & callback
+# ------------------------------
+def match_rules(pkt):
+    """Return True if packet should be allowed, False if it matches a block rule."""
+    try:
+        if IP in pkt:
+            src = pkt[IP].src
+            # IP-based blocking
+            if src in rules.get("block_ips", []):
+                return False
+        # Port-based blocking (source port checks are best-effort here)
+        if TCP in pkt:
+            try:
+                sport = int(pkt[TCP].sport)
+                if sport in rules.get("block_ports", []):
+                    return False
+            except Exception:
+                pass
+        if UDP in pkt:
+            try:
+                sport = int(pkt[UDP].sport)
+                if sport in rules.get("block_ports", []):
+                    return False
+            except Exception:
+                pass
+        # ICMP handling is done at iptables level; keep monitoring here if desired
+    except Exception:
+        # On unexpected packet types, default allow (but do not crash)
+        return True
+    return True
+
+def packet_callback(pkt):
+    action = "ALLOWED" if match_rules(pkt) else "BLOCKED"
+    # Print minimal summary to reduce noise
+    try:
+        print(f"[{action}] {pkt.summary()}")
+    except Exception:
+        # fallback if summary fails
+        print(f"[{action}] packet")
+
+# ------------------------------
+# Sniffer (IPv4 only to avoid ICMPv6 ND noise)
+# ------------------------------
+def start_sniffer():
+    """
+    Start sniffing packets. We use BPF filter 'ip' to capture IPv4 only.
+    Remove filter argument if you want IPv6 traffic too.
+    """
+    try:
+        sniff(filter="ip", prn=packet_callback, store=False)
+    except Exception as e:
+        print("Sniffer stopped or failed:", e)
+
+# ------------------------------
+# Cleanup and signal handling
+# ------------------------------
+def cleanup_and_exit(signum=None, frame=None):
+    print("\nCleaning up iptables and exiting...")
+    try:
+        flush_iptables()
+    except Exception as e:
+        print("Error flushing iptables:", e)
+    try:
+        save_rules()
+    except Exception as e:
+        print("Error saving rules:", e)
+    # brief pause to allow subprocesses to settle
+    time.sleep(0.2)
+    # Exit the program
+    os._exit(0)  # use os._exit to ensure all threads stop
+
+# Register handlers for Ctrl+C and termination
+signal.signal(signal.SIGINT, cleanup_and_exit)
+signal.signal(signal.SIGTERM, cleanup_and_exit)
+
+# ------------------------------
+# CLI command loop
+# ------------------------------
+def command_loop():
+    """
+    Interactive CLI prompt:
+    Commands:
+      - list
+      - add ip <ip>
+      - remove ip <ip>
+      - add port <port>
+      - remove port <port>
+      - add protocol ICMP
+      - remove protocol ICMP
+      - exit
+    """
+    while True:
+        try:
+            cmd_line = input("firewall> ")
+        except EOFError:
+            # EOF (e.g., Ctrl+D) -> clean exit
+            cleanup_and_exit()
+        except KeyboardInterrupt:
+            # Ctrl+C at prompt -> clean exit
+            cleanup_and_exit()
+
+        if not cmd_line:
+            continue
+        parts = cmd_line.strip().split()
+        cmd = parts[0].lower()
+
+        # ADD
+        if cmd == "add" and len(parts) == 3:
+            typ = parts[1].lower()
+            val = parts[2]
+            if typ == "ip":
+                if val in rules.get("block_ips", []):
+                    print("IP already blocked.")
+                else:
+                    rules["block_ips"].append(val)
+                    apply_rules()
+                    save_rules()
+                    print(f"✅ Added blocked IP: {val}")
+            elif typ == "port":
+                try:
+                    p = int(val)
+                    if p < 1 or p > 65535:
+                        print("Invalid port. Must be 1-65535.")
+                    elif p in rules.get("block_ports", []):
+                        print("Port already blocked.")
+                    else:
+                        rules["block_ports"].append(p)
+                        apply_rules()
+                        save_rules()
+                        print(f"✅ Added blocked port: {p}")
+                except ValueError:
+                    print("Invalid port number.")
+            elif typ == "protocol":
+                proto = val.upper()
+                if proto == "ICMP":
+                    if proto in rules.get("block_protocols", []):
+                        print("Protocol already blocked.")
+                    else:
+                        rules["block_protocols"].append(proto)
+                        apply_rules()
+                        save_rules()
+                        print("✅ Blocked ICMP (IPv4).")
+                else:
+                    print("Unsupported protocol (only ICMP is supported here).")
+            else:
+                print("Usage: add ip|port|protocol <value>")
+
+        # REMOVE
+        elif cmd == "remove" and len(parts) == 3:
+            typ = parts[1].lower()
+            val = parts[2]
+            if typ == "ip":
+                if val in rules.get("block_ips", []):
+                    rules["block_ips"].remove(val)
+                    apply_rules()
+                    save_rules()
+                    print(f"🗑️ Removed blocked IP: {val}")
+                else:
+                    print("IP not found in block list.")
+            elif typ == "port":
+                try:
+                    p = int(val)
+                    if p in rules.get("block_ports", []):
+                        rules["block_ports"].remove(p)
+                        apply_rules()
+                        save_rules()
+                        print(f"🗑️ Removed blocked port: {p}")
+                    else:
+                        print("Port not found in block list.")
+                except ValueError:
+                    print("Invalid port number.")
+            elif typ == "protocol":
+                proto = val.upper()
+                if proto in rules.get("block_protocols", []):
+                    rules["block_protocols"].remove(proto)
+                    apply_rules()
+                    save_rules()
+                    print(f"🗑️ Removed blocked protocol: {proto}")
+                else:
+                    print("Protocol not present.")
+            else:
+                print("Usage: remove ip|port|protocol <value>")
+
+        # LIST
+        elif cmd == "list":
+            print(json.dumps(rules, indent=2))
+
+        # EXIT
+        elif cmd == "exit":
+            cleanup_and_exit()
+
+        else:
+            print("Commands: add/remove ip|port|protocol <value>, list, exit")
+
+# ------------------------------
+# Main
+# ------------------------------
+if __name__ == "__main__":
+    # Ensure we run with sufficient privileges when actually applying iptables.
+    if os.geteuid() != 0:
+        print("Warning: For full functionality you should run this script with sudo (root).")
+        print("You can still test filtering output, but iptables changes will fail without root.")
+
+    load_rules()
+    try:
+        apply_rules()
+    except Exception as e:
+        print("Warning: apply_rules() failed on startup (check sudo/root):", e)
+
+    print("🚀 Dynamic Firewall started. Type 'list' to see rules, 'exit' to stop.")
+    # Start sniffer thread
+    t = threading.Thread(target=start_sniffer, daemon=True)
+    t.start()
+
+    # Enter CLI loop (main thread)
+    command_loop()
+Open a terminal in the project folder and run these steps:
+# (once) create virtualenv if you don't have one
+python3 -m venv venv
+
+# activate venv
+source venv/bin/activate
+
+# install scapy inside venv
+pip install scapy
+
+# run the script (use sudo for iptables changes)
+sudo ./venv/bin/python firewall.py4
+You should see:
+🚀 Dynamic Firewall started. Type 'list' to see rules, 'exit' to stop.
+firewall>
+At the firewall> prompt, type commands (press Enter after each):
+firewall> list
+firewall> add ip 192.168.1.8
+firewall> add port 22
+firewall> add protocol ICMP
+firewall> remove ip 192.168.1.8
+firewall> exit
+Verification & test commands
+
+From a second terminal, verify iptables and behavior:
+Show iptables rules:
+sudo iptables -L -v -n --line-numbers
+Test blocked IP (replace with an IP you blocked):
+ping -c 4 192.168.1.8
+curl http://192.168.1.8
+Test blocked port:
+nc -vz 192.168.1.100 22   # (or curl to target host with port)
+If ICMP blocked:
+ping -4 8.8.8.8   # should not return replies if ICMP was blocked globally
+If you need to force recovery (flush all iptables rules)
+sudo iptables -F
+Example terminal session
+$ sudo ./venv/bin/python firewall.py4
+🚀 Dynamic Firewall started. Type 'list' to see rules, 'exit' to stop.
+firewall> list
+{
+  "block_ips": ["192.168.1.7"],
+  "block_ports": [80],
+  "block_protocols": ["ICMP"]
+}
+firewall> add ip 192.168.1.8
+✅ Added blocked IP: 192.168.1.8
+firewall> add port 22
+✅ Added blocked port: 22
+firewall> add protocol ICMP
+✅ Blocked ICMP (IPv4).
+firewall> list
+{
+  "block_ips": [
+    "192.168.1.7",
+    "192.168.1.8"
+  ],
+  "block_ports": [
+    80,
+    22
+  ],
+  "block_protocols": [
+    "ICMP"
+  ]
+}
+# (In another terminal)
+$ sudo iptables -L -v -n
+# shows DROP rules added; counters increment when packets hit them
+# Back to firewall:
+firewall> remove ip 192.168.1.8
+🗑️ Removed blocked IP: 192.168.1.8
+firewall> exit
+
+Cleaning up iptables and exiting...
+# script exits, iptables flushed, rules.json saved
+
+
+
 
