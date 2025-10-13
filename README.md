@@ -578,7 +578,7 @@ Create rules.json in the same folder as the script (or let the script auto-creat
 Full script — firewall.py4
 #!/usr/bin/env python3
 """
-Personal Firewall - Day 4 Complete Script (ready to paste)
+Personal Firewall - Day 4 Complete Script 
 - Live packet sniffing (IPv4 only)
 - Dynamic CLI to add/remove/list rules
 - Apply rules to iptables immediately
